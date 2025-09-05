@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
 from core.llm import generate_reply
 from core.memory import Memory
-from infra.monitoring import health_payload
+from infra.monitoring import health_payload, now, log_json
 
 load_dotenv()
 
