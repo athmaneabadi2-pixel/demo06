@@ -5,14 +5,30 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
-from core.llm import generate_reply
+from core.llm import safe_generate_reply
 from core.memory import Memory
 from infra.monitoring import health_payload, now, log_json
 
 load_dotenv()
 
 app = Flask(__name__)
-memory = Memory(profile_path=PROFILE_PATH)
+# -- Jour 1: init mémoire tolérante au profil cassé --
+try:
+    memory = Memory(profile_path=PROFILE_PATH)
+except Exception as e:
+    print(f"⚠️ Profil invalide ou introuvable ({e}) → fallback par défaut")
+    class _Dummy:
+        def get_profile(self):
+            return {
+                "display_name": "Ami",
+                "language": "fr",
+                "timezone": "Europe/Paris",
+                "tone": "chaleureux",
+                "short_sentences": True,
+            }
+    memory = _Dummy()
+# -- fin ajout --
+
 # -- ajoute ça une seule fois au niveau module (pas dans une route) --
 def _env_flags():
     keys = [
