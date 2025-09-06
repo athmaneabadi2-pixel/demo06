@@ -1,14 +1,16 @@
--- Schéma minimal d'exemple (à adapter)
+PRAGMA journal_mode=WAL;
+
 CREATE TABLE IF NOT EXISTS messages (
-  id SERIAL PRIMARY KEY,
-  direction TEXT,         -- 'in' | 'out'
-  source TEXT,            -- 'webhook' | 'cron_weather' | ...
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  user_id TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'whatsapp',
+  direction TEXT NOT NULL CHECK (direction IN ('IN','OUT')),
   msg_sid TEXT,
-  content TEXT,
-  content_hash TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
+  text TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_msgsid_dir
-  ON messages (msg_sid, direction)
-  WHERE msg_sid IS NOT NULL AND direction IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(user_id, ts);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_sid_dir
+  ON messages(msg_sid, direction) WHERE msg_sid IS NOT NULL;

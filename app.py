@@ -5,13 +5,21 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
-from core.llm import safe_generate_reply
+from core.llm import safe_generate_reply, safe_generate_reply_with_history
 from core.memory import Memory
-from infra.monitoring import health_payload, now, log_json
+from infra.monitoring import now, log_json, health_payload
+from db.db import init_schema, add_message, get_history, normalize_user_id
+
 
 load_dotenv()
 
 app = Flask(__name__)
+# -- Jour 2: init DB schema (tolérant) --
+try:
+    init_schema()
+except Exception as e:
+    log_json("db_init_error", error=str(e))
+# -- fin --
 # -- Jour 1: init mémoire tolérante au profil cassé --
 try:
     memory = Memory(profile_path=PROFILE_PATH)
@@ -49,23 +57,45 @@ def health():
 def internal_send():
     expected = os.getenv("INTERNAL_TOKEN")
     provided = request.headers.get("X-Token")
-    if not expected or provided != expected:
+    if expected and provided != expected:
         return jsonify({"error": "forbidden"}), 403
 
-    data = request.json or {}
-    text = data.get("text", "Bonjour")
+    data = request.get_json(silent=True) or {}
+    user_text = (data.get("text") or "Bonjour").strip()
     profile = memory.get_profile()
+    user_id = "local"
 
+    # IN → DB
     try:
-        reply = generate_reply(text, profile)
+        add_message(user_id, "IN", user_text, msg_sid=None, channel="internal")
     except Exception as e:
-        # Fallback si OPENAI ou profil posent problème
+        log_json("db_write_error", where="internal_send_IN", error=str(e))
+
+        # Historique pour l'utilisateur local
+    try:
+        history = get_history(user_id, limit=16)
+    except Exception as e:
+        history = []
+        log_json("db_read_error", where="internal_get_history", error=str(e))
+
+    # LLM (avec historique, retry + fallback)
+    try:
+        reply = safe_generate_reply_with_history(user_text, history, profile)
+    except Exception as e:
+        log_json("error", where="internal_send_llm", error=str(e))
         name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
-        reply = f"Salut ! Petit contretemps technique ({type(e).__name__}). Dis-moi ta priorité du jour et je t'aide. — {name} 🤝"
+        reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+
+
+    # OUT → DB
+    try:
+        add_message(user_id, "OUT", reply, msg_sid=None, channel="internal")
+    except Exception as e:
+        log_json("db_write_error", where="internal_send_OUT", error=str(e))
 
     if (request.args.get("format") or "").lower() == "text":
         return Response(reply, mimetype="text/plain; charset=utf-8"), 200
-    return jsonify({"ok": True, "request_text": text, "reply": reply}), 200
+    return jsonify({"ok": True, "request_text": user_text, "reply": reply}), 200
 
 
 @app.post("/internal/checkin")
@@ -88,7 +118,8 @@ def internal_checkin():
     prompt += f" Date/heure: {now}. Utilise mes intérêts si utile."
 
     try:
-        text = generate_reply(prompt, profile)
+        text = safe_generate_reply(prompt, profile)
+
     except Exception as e:
         name = (profile or {}).get("display_name", "Coach") if isinstance(profile, dict) else "Coach"
         text = (f"Bonjour ! Petit check-in rapide. Deux priorités + un conseil pour lancer la journée. "
@@ -120,7 +151,40 @@ def internal_checkin():
 def whatsapp_webhook():
     incoming = request.form or request.json or {}
     text = (incoming.get("Body") or incoming.get("text") or "").strip() or "Salut"
+
+    from_raw = incoming.get("From") or incoming.get("from") or "unknown"
+    user_id = normalize_user_id(from_raw)
+    msg_sid = incoming.get("MessageSid") or incoming.get("messageSid")
+
+    # IN -> DB (idempotence future via unique index sur (msg_sid,direction))
+    try:
+        add_message(user_id, "IN", text, msg_sid=msg_sid, channel="whatsapp")
+    except Exception as e:
+        log_json("db_write_error", where="webhook_IN", error=str(e), msg_sid=msg_sid)
+
+    # Historique (dernier ~8 tours = 16 messages max)
+    try:
+        history = get_history(user_id, limit=16)
+        log_json("history_loaded", user_id=user_id, n=len(history))
+    except Exception as e:
+        history = []
+        log_json("db_read_error", where="get_history", error=str(e))
+
+    # LLM (avec historique, retry+fallback)
     profile = memory.get_profile()
-    reply = generate_reply(text, profile)
+    try:
+        reply = safe_generate_reply_with_history(text, history, profile)
+    except Exception as e:
+        log_json("error", where="webhook_llm", error=str(e))
+        name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
+        reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+
+    # OUT -> DB
+    try:
+        add_message(user_id, "OUT", reply, msg_sid=None, channel="whatsapp")
+    except Exception as e:
+        log_json("db_write_error", where="webhook_OUT", error=str(e))
+
+    # Réponse Twilio (TwiML)
     twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
     return Response(twiml, mimetype="application/xml")

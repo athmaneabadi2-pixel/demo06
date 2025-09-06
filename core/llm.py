@@ -1,7 +1,8 @@
 # core/llm.py
-import os, json, textwrap
+import os, json, textwrap, time
 from datetime import datetime
 from openai import OpenAI
+from infra.monitoring import log_json as _log
 
 # ---------- Chargement profil ----------
 def load_profile(path: str = "profile.json") -> dict:
@@ -22,12 +23,12 @@ def load_profile(path: str = "profile.json") -> dict:
         }
 
 def _ensure_profile(profile_or_path) -> dict:
-    """Accepte soit un dict (déjà chargé), soit un chemin vers le JSON."""
+    """Accepte soit un dict, soit un chemin vers le JSON."""
     if isinstance(profile_or_path, dict):
         return profile_or_path
     return load_profile(profile_or_path or "profile.json")
 
-# ---------- Prompt de base ----------
+# ---------- Prompt ----------
 def base_prompt() -> str:
     try:
         with open("LLM_SYSTEM_PROMPT.txt", "r", encoding="utf-8") as f:
@@ -52,7 +53,6 @@ def build_system_prompt(profile: dict) -> str:
     prefs = profile.get("preferences", {})
     max_chars = int(prefs.get("reply_max_chars", 400))
     emoji_level = prefs.get("emoji_level", "léger")
-
     persona = profile.get("persona", "")
 
     sys = f"""
@@ -73,13 +73,9 @@ Règles de style:
 - Pas de jargon. Concret. Actionnable tout de suite.
 - Si tu n'es pas sûr, demande une précision en UNE phrase.
 - N'invente pas de faits externes (pas de météo live si non fournie).
-- Si le message est juste un salut (ex: "salut", "bonjour"), réponds en 1 phrase personnalisée + 1 petite question contextuelle.
-- Ne répète pas exactement la même phrase d’accueil plus d’une fois par conversation.
-- Si l’utilisateur dit "ça va ?" réponds brièvement puis proposes une action utile (priorités, rappel, note rapide).
-
-Quand "checkin" est demandé:
-- Format: bonjour bref + météo (si dispo) + 1–2 priorités + 1 conseil.
-- Garde la voix {tone}. Termine par la signature.
+- Salut simple → 1 phrase perso + 1 petite question contextuelle.
+- Ne répète pas la même phrase d’accueil plus d’une fois par conversation.
+- “ça va ?” → réponds bref + propose une action utile (priorité / rappel / note).
 """
     return textwrap.dedent(sys).strip()
 
@@ -133,3 +129,67 @@ def generate_checkin(profile_or_path="profile.json", weather_hint=None) -> str:
         temperature=0.6,
     )
     return enforce_style(rsp.choices[0].message.content, profile)
+
+# ---------- Wrapper sûr (retry + fallback) ----------
+def safe_generate_reply(user_text: str, profile_or_path="profile.json") -> str:
+    """
+    Appelle generate_reply avec:
+      - 1 retry si rate-limit/timeout,
+      - fallback poli en cas d'échec.
+    """
+    last_err = None
+    for attempt in range(2):
+        try:
+            return generate_reply(user_text, profile_or_path)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if attempt == 0 and any(x in msg for x in ("429", "Rate limit", "timeout", "Timeout")):
+                _log("retry", where="openai", reason="rate_limit_or_timeout")
+                time.sleep(2)
+                continue
+            break
+    _log("error", where="openai", error=str(last_err))
+    profile = _ensure_profile(profile_or_path)
+    name = profile.get("display_name", "Ami")
+    return f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+# --- Jour 2: génération AVEC historique ---
+def generate_reply_with_history(user_text: str, history, profile_or_path="profile.json") -> str:
+    """
+    history: liste [(direction, text, ts), ...] du plus ancien au plus récent
+    """
+    profile = _ensure_profile(profile_or_path)
+    system = build_system_prompt(profile)
+    messages = [{"role": "system", "content": system}]
+    # on limite à ~16 messages (8 tours)
+    hist = history[-16:] if history else []
+    for direction, txt, ts in hist:
+        role = "user" if direction == "IN" else "assistant"
+        messages.append({"role": role, "content": str(txt or "")})
+    messages.append({"role": "user", "content": user_text})
+
+    rsp = client().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.7,
+    )
+    return enforce_style(rsp.choices[0].message.content, profile)
+
+def safe_generate_reply_with_history(user_text: str, history, profile_or_path="profile.json") -> str:
+    last_err = None
+    for attempt in range(2):
+        try:
+            return generate_reply_with_history(user_text, history, profile_or_path)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if attempt == 0 and any(x in msg for x in ("429", "Rate limit", "timeout", "Timeout")):
+                _log("retry", where="openai", reason="rate_limit_or_timeout")
+                time.sleep(2)
+                continue
+            break
+    _log("error", where="openai", error=str(last_err))
+    profile = _ensure_profile(profile_or_path)
+    name = profile.get("display_name", "Ami")
+    return f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+# --- fin ajout ---
