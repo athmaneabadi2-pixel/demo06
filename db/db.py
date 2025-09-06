@@ -40,3 +40,12 @@ def get_history(user_id: str, limit: int = 20) -> List[Tuple[str, str, str]]:
             (user_id, limit)
         ).fetchall()
     return list(reversed(rows))
+def has_incoming_sid(msg_sid: str) -> bool:
+    if not msg_sid:
+        return False
+    with _conn() as con:
+        row = con.execute(
+            "SELECT 1 FROM messages WHERE msg_sid=? AND direction='IN' LIMIT 1",
+            (msg_sid,)
+        ).fetchone()
+    return bool(row)

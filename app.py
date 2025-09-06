@@ -4,11 +4,19 @@ import html
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
+load_dotenv()  # <-- déplacer ici
+
 from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
 from core.llm import safe_generate_reply, safe_generate_reply_with_history
-from core.memory import Memory
-from infra.monitoring import now, log_json, health_payload
-from db.db import init_schema, add_message, get_history, normalize_user_id
+...
+import uuid
+from db.db import init_schema, add_message, get_history, normalize_user_id, has_incoming_sid
+
+# mini rate-limit (par user, mémoire-process)
+LAST_SEEN = {}
+RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "1.5"))
+
+
 
 
 load_dotenv()
@@ -65,13 +73,13 @@ def internal_send():
     profile = memory.get_profile()
     user_id = "local"
 
-    # IN → DB
+        # IN → DB
     try:
         add_message(user_id, "IN", user_text, msg_sid=None, channel="internal")
     except Exception as e:
         log_json("db_write_error", where="internal_send_IN", error=str(e))
 
-        # Historique pour l'utilisateur local
+    # Historique pour l'utilisateur local
     try:
         history = get_history(user_id, limit=16)
     except Exception as e:
@@ -85,6 +93,7 @@ def internal_send():
         log_json("error", where="internal_send_llm", error=str(e))
         name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
         reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+
 
 
     # OUT → DB
@@ -149,42 +158,62 @@ def internal_checkin():
 
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook():
+    t0 = now()
     incoming = request.form or request.json or {}
     text = (incoming.get("Body") or incoming.get("text") or "").strip() or "Salut"
-
     from_raw = incoming.get("From") or incoming.get("from") or "unknown"
     user_id = normalize_user_id(from_raw)
     msg_sid = incoming.get("MessageSid") or incoming.get("messageSid")
+    req_id = msg_sid or str(uuid.uuid4())
 
-    # IN -> DB (idempotence future via unique index sur (msg_sid,direction))
+    # 0) dédup strict (avant tout traitement)
+    if msg_sid and has_incoming_sid(msg_sid):
+        log_json("dedup_skip", req_id=req_id, user_id=user_id, msg_sid=msg_sid)
+        return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>',
+                        mimetype="application/xml", status=200)
+
+    # 1) on enregistre IN (prépare l'idempotence DB)
     try:
         add_message(user_id, "IN", text, msg_sid=msg_sid, channel="whatsapp")
     except Exception as e:
-        log_json("db_write_error", where="webhook_IN", error=str(e), msg_sid=msg_sid)
+        log_json("db_write_error", where="webhook_IN", error=str(e), req_id=req_id)
 
-    # Historique (dernier ~8 tours = 16 messages max)
+    # 2) mini rate-limit (cooldown)
+    last = LAST_SEEN.get(user_id, 0.0)
+    if now() - last < RATE_LIMIT_SECONDS:
+        reply = "Merci 🙂 je traite ton message, j’arrive…"
+        try:
+            add_message(user_id, "OUT", reply, msg_sid=None, channel="whatsapp")
+        except Exception as e:
+            log_json("db_write_error", where="webhook_OUT_rl", error=str(e), req_id=req_id)
+        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
+        log_json("rate_limit", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
+        return Response(twiml, mimetype="application/xml", status=200)
+
+    # autoriser le prochain message après ce traitement
+    LAST_SEEN[user_id] = now()
+
+    # 3) historique + LLM (retry/fallback)
     try:
         history = get_history(user_id, limit=16)
-        log_json("history_loaded", user_id=user_id, n=len(history))
     except Exception as e:
         history = []
-        log_json("db_read_error", where="get_history", error=str(e))
+        log_json("db_read_error", where="get_history", error=str(e), req_id=req_id)
 
-    # LLM (avec historique, retry+fallback)
     profile = memory.get_profile()
     try:
         reply = safe_generate_reply_with_history(text, history, profile)
     except Exception as e:
-        log_json("error", where="webhook_llm", error=str(e))
+        log_json("error", where="webhook_llm", error=str(e), req_id=req_id)
         name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
         reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
 
-    # OUT -> DB
+    # 4) OUT -> DB
     try:
         add_message(user_id, "OUT", reply, msg_sid=None, channel="whatsapp")
     except Exception as e:
-        log_json("db_write_error", where="webhook_OUT", error=str(e))
+        log_json("db_write_error", where="webhook_OUT", error=str(e), req_id=req_id)
 
-    # Réponse Twilio (TwiML)
     twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
+    log_json("webhook_done", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
     return Response(twiml, mimetype="application/xml")

@@ -5,3 +5,6 @@ __pycache__
 .venv/
 __pycache__/
 local.db
+local.db
+local.db-wal
+local.db-shm
