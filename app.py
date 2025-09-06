@@ -1,34 +1,30 @@
-import os
-from flask import Flask, request, jsonify, Response
-import html
-import requests
+import os, html, time, uuid, requests
 from datetime import datetime
+from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
-load_dotenv()  # <-- déplacer ici
+
+# Charger l'environnement AVANT toute lecture d'ENV
+load_dotenv()
 
 from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
 from core.llm import safe_generate_reply, safe_generate_reply_with_history
-...
-import uuid
+from core.memory import Memory
+from infra.monitoring import now, log_json, health_payload
 from db.db import init_schema, add_message, get_history, normalize_user_id, has_incoming_sid
 
-# mini rate-limit (par user, mémoire-process)
+app = Flask(__name__)
+
+# --- Mini rate-limit (mémoire-process) ---
 LAST_SEEN = {}
 RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "1.5"))
 
-
-
-
-load_dotenv()
-
-app = Flask(__name__)
-# -- Jour 2: init DB schema (tolérant) --
+# --- Init DB tolérante ---
 try:
     init_schema()
 except Exception as e:
     log_json("db_init_error", error=str(e))
-# -- fin --
-# -- Jour 1: init mémoire tolérante au profil cassé --
+
+# --- Init mémoire tolérante au profil cassé ---
 try:
     memory = Memory(profile_path=PROFILE_PATH)
 except Exception as e:
@@ -43,19 +39,23 @@ except Exception as e:
                 "short_sentences": True,
             }
     memory = _Dummy()
-# -- fin ajout --
 
-# -- ajoute ça une seule fois au niveau module (pas dans une route) --
-def _env_flags():
-    keys = [
-        "TWILIO_ACCOUNT_SID",
-        "TWILIO_AUTH_TOKEN",
-        "TWILIO_SANDBOX_FROM",
-        "USER_WHATSAPP_TO",
-        "OPENAI_API_KEY",
-    ]
-    return {k: bool(os.getenv(k)) for k in keys}
+# --- Helper HTTP Twilio avec retries (429/5xx) ---
+def _post_twilio_with_retry(url, data, auth, timeout=15, retries=2):
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(url, data=data, auth=auth, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            return r
+        except requests.RequestException:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
+# ------------------- Routes -------------------
 
 @app.get("/health")
 def health():
@@ -65,47 +65,51 @@ def health():
 def internal_send():
     expected = os.getenv("INTERNAL_TOKEN")
     provided = request.headers.get("X-Token")
-    if expected and provided != expected:
+    if not expected or provided != expected:
         return jsonify({"error": "forbidden"}), 403
 
     data = request.get_json(silent=True) or {}
     user_text = (data.get("text") or "Bonjour").strip()
     profile = memory.get_profile()
-    user_id = "local"
 
-        # IN → DB
+    req_id = str(uuid.uuid4())
+    t0 = now()
+
+    # IN -> DB
+    user_id = "local"
     try:
         add_message(user_id, "IN", user_text, msg_sid=None, channel="internal")
     except Exception as e:
-        log_json("db_write_error", where="internal_send_IN", error=str(e))
+        log_json("db_write_error", where="internal_send_IN", error=str(e), req_id=req_id)
 
-    # Historique pour l'utilisateur local
+    # Historique
     try:
         history = get_history(user_id, limit=16)
     except Exception as e:
         history = []
-        log_json("db_read_error", where="internal_get_history", error=str(e))
+        log_json("db_read_error", where="internal_get_history", error=str(e), req_id=req_id)
 
-    # LLM (avec historique, retry + fallback)
+    # LLM (+fallback)
     try:
         reply = safe_generate_reply_with_history(user_text, history, profile)
+        ok = True
     except Exception as e:
-        log_json("error", where="internal_send_llm", error=str(e))
+        log_json("error", where="internal_send_llm", error=str(e), req_id=req_id)
         name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
-        reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+        reply, ok = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝", False
 
-
-
-    # OUT → DB
+    # OUT -> DB
     try:
         add_message(user_id, "OUT", reply, msg_sid=None, channel="internal")
     except Exception as e:
-        log_json("db_write_error", where="internal_send_OUT", error=str(e))
+        log_json("db_write_error", where="internal_send_OUT", error=str(e), req_id=req_id)
+
+    lat = round(now() - t0, 3)
+    log_json("internal_send_done", req_id=req_id, status="ok" if ok else "fail", latency=lat)
 
     if (request.args.get("format") or "").lower() == "text":
         return Response(reply, mimetype="text/plain; charset=utf-8"), 200
-    return jsonify({"ok": True, "request_text": user_text, "reply": reply}), 200
-
+    return jsonify({"ok": ok, "reply": reply, "latency": lat}), 200
 
 @app.post("/internal/checkin")
 def internal_checkin():
@@ -114,21 +118,22 @@ def internal_checkin():
     if not expected or provided != expected:
         return jsonify({"error": "forbidden"}), 403
 
+    t0 = now()
+
     body = request.get_json(silent=True) or {}
     to = body.get("to") or os.getenv("USER_WHATSAPP_TO")
     weather_hint = body.get("weather") or os.getenv("WEATHER_SUMMARY")
 
     profile = memory.get_profile()
-    now = datetime.now().strftime("%A %d %B, %H:%M")
+    now_str = datetime.now().strftime("%A %d %B, %H:%M")
     prompt = ("Fais un check-in du matin (bref). "
               "Format: bonjour bref + météo (si fournie) + 1–2 priorités + 1 conseil.")
     if weather_hint:
         prompt += f" Météo: {weather_hint}."
-    prompt += f" Date/heure: {now}. Utilise mes intérêts si utile."
+    prompt += f" Date/heure: {now_str}. Utilise mes intérêts si utile."
 
     try:
         text = safe_generate_reply(prompt, profile)
-
     except Exception as e:
         name = (profile or {}).get("display_name", "Coach") if isinstance(profile, dict) else "Coach"
         text = (f"Bonjour ! Petit check-in rapide. Deux priorités + un conseil pour lancer la journée. "
@@ -141,20 +146,22 @@ def internal_checkin():
     if sid and tok and to:
         try:
             url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-            r = requests.post(url, data={"From": from_wa, "To": to, "Body": text}, auth=(sid, tok), timeout=15)
+            r = _post_twilio_with_retry(url, {"From": from_wa, "To": to, "Body": text},
+                                        auth=(sid, tok), timeout=15, retries=2)
             try:
                 js = r.json()
             except Exception:
                 js = {"status_code": r.status_code, "text": r.text[:200]}
+            log_json("checkin_done", status="sent", latency=round(now()-t0,3))
             return jsonify({"status": "sent", "twilio": js}), 200
         except Exception as e:
+            log_json("checkin_done", status="twilio-error", error=str(e), latency=round(now()-t0,3))
             return jsonify({"status": "twilio-error",
                             "error": f"{type(e).__name__}: {str(e)[:160]}",
                             "dry_run_text": text}), 200
 
+    log_json("checkin_done", status="dry-run", latency=round(now()-t0,3))
     return jsonify({"status": "dry-run", "text": text}), 200
-
-
 
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook():
@@ -172,7 +179,7 @@ def whatsapp_webhook():
         return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>',
                         mimetype="application/xml", status=200)
 
-    # 1) on enregistre IN (prépare l'idempotence DB)
+    # 1) enregistrer IN
     try:
         add_message(user_id, "IN", text, msg_sid=msg_sid, channel="whatsapp")
     except Exception as e:
@@ -190,10 +197,9 @@ def whatsapp_webhook():
         log_json("rate_limit", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
         return Response(twiml, mimetype="application/xml", status=200)
 
-    # autoriser le prochain message après ce traitement
     LAST_SEEN[user_id] = now()
 
-    # 3) historique + LLM (retry/fallback)
+    # 3) historique + LLM
     try:
         history = get_history(user_id, limit=16)
     except Exception as e:
