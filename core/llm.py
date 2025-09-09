@@ -90,12 +90,17 @@ def enforce_style(text: str, profile: dict) -> str:
         text += sig
     return text
 
-# ---------- Client OpenAI ----------
+# ---------- Client OpenAI avec timeout & retries ----------
 _client = None
 def client():
+    """Client OpenAI robuste: timeout global + 2 retries SDK."""
     global _client
     if _client is None:
-        _client = OpenAI()  # lit OPENAI_API_KEY depuis l'env (.env / Render)
+        _client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=15.0,      # secondes
+            max_retries=2      # le SDK retente automatiquement
+        )
     return _client
 
 # ---------- Générateurs ----------
@@ -153,6 +158,7 @@ def safe_generate_reply(user_text: str, profile_or_path="profile.json") -> str:
     profile = _ensure_profile(profile_or_path)
     name = profile.get("display_name", "Ami")
     return f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
+
 # --- Jour 2: génération AVEC historique ---
 def generate_reply_with_history(user_text: str, history, profile_or_path="profile.json") -> str:
     """
@@ -161,7 +167,6 @@ def generate_reply_with_history(user_text: str, history, profile_or_path="profil
     profile = _ensure_profile(profile_or_path)
     system = build_system_prompt(profile)
     messages = [{"role": "system", "content": system}]
-    # on limite à ~16 messages (8 tours)
     hist = history[-16:] if history else []
     for direction, txt, ts in hist:
         role = "user" if direction == "IN" else "assistant"
@@ -192,4 +197,3 @@ def safe_generate_reply_with_history(user_text: str, history, profile_or_path="p
     profile = _ensure_profile(profile_or_path)
     name = profile.get("display_name", "Ami")
     return f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
-# --- fin ajout ---
