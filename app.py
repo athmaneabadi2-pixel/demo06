@@ -1,4 +1,4 @@
-import os, html, time, uuid, requests
+import os, html, time, uuid, requests, hmac, hashlib, base64
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
@@ -54,6 +54,25 @@ def _post_twilio_with_retry(url, data, auth, timeout=15, retries=2):
                 time.sleep(2 ** attempt)
                 continue
             raise
+
+# --- Vérification optionnelle de signature Twilio (HMAC-SHA1/Base64) ---
+def _verify_twilio_sig(req) -> bool:
+    if os.getenv("VERIFY_TWILIO_SIGNATURE", "false").lower() not in ("1", "true", "yes"):
+        return True  # désactivé (local/sandbox)
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN") or ""
+    public_url = (os.getenv("PUBLIC_WEBHOOK_URL") or "").rstrip("/")
+    sig = req.headers.get("X-Twilio-Signature") or ""
+    if not auth_token or not public_url or not sig:
+        return False
+    if req.form:
+        parts = "".join(v for k, v in sorted(req.form.items()))
+        data = public_url + parts
+    else:
+        # Twilio envoie du form-urlencoded ; fallback JSON au cas où
+        data = public_url + (req.get_data(as_text=True) or "")
+    mac = hmac.new(auth_token.encode("utf-8"), data.encode("utf-8"), hashlib.sha1)
+    expected = base64.b64encode(mac.digest()).decode("utf-8")
+    return hmac.compare_digest(sig, expected)
 
 # ------------------- Routes -------------------
 
@@ -166,6 +185,13 @@ def internal_checkin():
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook():
     t0 = now()
+
+    # (option) vérifier la signature Twilio
+    if not _verify_twilio_sig(request):
+        log_json("twilio_sig_invalid")
+        return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>',
+                        mimetype="application/xml", status=403)
+
     incoming = request.form or request.json or {}
     text = (incoming.get("Body") or incoming.get("text") or "").strip() or "Salut"
     from_raw = incoming.get("From") or incoming.get("from") or "unknown"
