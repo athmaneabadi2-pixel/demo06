@@ -16,6 +16,11 @@ db/
 .DS_Store
 Thumbs.db
 
-# Fichiers saisis par erreur
+# Fichiers saisis par erreur (locaux)
 25.2
 cd
+code
+curl
+python
+set
+requetedbeaver.txt
