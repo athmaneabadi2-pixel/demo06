@@ -249,3 +249,8 @@ def whatsapp_webhook():
     twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
     log_json("webhook_done", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
     return Response(twiml, mimetype="application/xml")
+if __name__ == "__main__":
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    # Host 127.0.0.1 en local; en prod Render, c'est gunicorn qui sert.
+    app.run(host="127.0.0.1", port=port, debug=True)
