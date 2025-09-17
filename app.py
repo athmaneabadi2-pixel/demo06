@@ -31,7 +31,8 @@ CORE_DIR = os.path.join(ROOT, "template", "lanai_core")
 if CORE_DIR not in sys.path:
     sys.path.insert(0, CORE_DIR)
 import core as coreapp                   # noyau: bootstrap_memory + process_incoming
-from memory_store import get_history     # util pour afficher l'historique si besoin
+from core.memory import get_history
+
 
 # ---- OpenAI avec timeout/retries + logs latence ----
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
