@@ -1,36 +1,20 @@
-# Python / venv
-__pycache__/
-*.py[cod]
-.venv/
-
-# DB et env locaux (ne pas versionner)
-.env
-local.db
-*.sqlite3
-*.db
-db/
-
-# OS/IDE
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Fichiers saisis par erreur (locaux)
-25.2
-cd
-code
-curl
-python
-set
-requetedbeaver.txt
-# demo06 local artifacts
+# local env & venv
 .env
 .venv/
 __pycache__/
 *.pyc
 
-# Local sqlite files
+# local db
 *.db
 *.db-shm
 *.db-wal
+local.db
+
+# déchets de tests/cli copiés par erreur
+cd
+code
+curl
+python
+set
+25.2
+requetedbeaver.txt
