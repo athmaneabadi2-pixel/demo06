@@ -1,256 +1,239 @@
-import os, html, time, uuid, requests, hmac, hashlib, base64
-from datetime import datetime
-from flask import Flask, request, jsonify, Response
-from dotenv import load_dotenv
+# app.py (instance demo06) — Lanai-like générique & robuste
+# - Flask + worker async
+# - Mémoire courte + idempotence via template/lanai_core/core.py
+# - OpenAI (timeout/retry, logs latence)
+# - Twilio optionnel (no-op en dev), signature activable
+# - Charge .env automatiquement (python-dotenv)
 
-# Charger l'environnement AVANT toute lecture d'ENV
+import sys, os, time, uuid
+from typing import List, Dict
+from flask import Flask, request, jsonify, Response, g
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+import unicodedata
+
+def _clean_outgoing(text: str) -> str:
+    # Normalise et supprime les espaces “exotiques” qui cassent certains clients
+    s = unicodedata.normalize("NFC", text or "")
+    s = s.replace("\u202f", " ").replace("\xa0", " ")  # espace fine insécable / NBSP → espace normal
+    try:
+        s.encode("utf-8")  # vérifie encodage
+    except Exception:
+        s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    return s
+
+# ---- Charger les variables locales (.env) ----
 load_dotenv()
 
-from config import DISPLAY_NAME, INSTANCE_LABEL, TIMEZONE, FEATURES, PROFILE_PATH
-from core.llm import safe_generate_reply, safe_generate_reply_with_history
-from core.memory import Memory
-from infra.monitoring import now, log_json, health_payload
-from db.db import init_schema, add_message, get_history, normalize_user_id, has_incoming_sid
+# ---- Localiser le noyau lanai_core (2 niveaux au-dessus) ----
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+CORE_DIR = os.path.join(ROOT, "template", "lanai_core")
+if CORE_DIR not in sys.path:
+    sys.path.insert(0, CORE_DIR)
+import core as coreapp                   # noyau: bootstrap_memory + process_incoming
+from memory_store import get_history     # util pour afficher l'historique si besoin
 
-app = Flask(__name__)
+# ---- OpenAI avec timeout/retries + logs latence ----
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT = float(os.environ.get("OPENAI_REQUEST_TIMEOUT", "8"))   # ← 8s
+OPENAI_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", "1"))        # ← 1 retry
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "180"))    # ← 180 tokens
 
-# --- Mini rate-limit (mémoire-process) ---
-LAST_SEEN = {}
-RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "1.5"))
+def _openai_generate(prompt_messages: List[Dict]) -> str:
+    import time as _t
+    t0 = _t.time()
+    # SDK v1
+    try:
+        from openai import OpenAI
+        base = OpenAI(api_key=OPENAI_API_KEY)
+        client = base.with_options(timeout=OPENAI_TIMEOUT, max_retries=OPENAI_RETRIES)
+        r = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=prompt_messages,
+            temperature=0.3,                 # ← réponses plus stables/rapides
+            max_tokens=OPENAI_MAX_TOKENS
+        )
+        dt = int((_t.time() - t0) * 1000)
+        print(f"[GPT][v1] ms={dt}", flush=True)
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e1:
+        print(f"[GPT][v1-fail] {e1}", flush=True)
+    # Fallback v0.28
+    try:
+        import openai
+        if OPENAI_API_KEY:
+            openai.api_key = OPENAI_API_KEY
+        r = openai.ChatCompletion.create(
+            model=os.environ.get("OPENAI_MODEL_FALLBACK", "gpt-3.5-turbo"),
+            messages=prompt_messages,
+            temperature=0.3,
+            max_tokens=OPENAI_MAX_TOKENS,
+            request_timeout=OPENAI_TIMEOUT
+        )
+        dt = int((_t.time() - t0) * 1000)
+        print(f"[GPT][v028] ms={dt}", flush=True)
+        return (r["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e2:
+        dt = int((_t.time() - t0) * 1000)
+        print(f"[GPT][v028-fail] ms={dt} err={e2}", flush=True)
+        return "Désolé, je ne peux pas répondre pour le moment."
 
-# --- Init DB tolérante ---
+
+# ---- Twilio optionnel (no-op en dev), signature activable ----
 try:
-    init_schema()
-except Exception as e:
-    log_json("db_init_error", error=str(e))
+    from twilio.rest import Client as TwilioClient
+    from twilio.request_validator import RequestValidator
+    _TWILIO_OK = True
+except Exception:
+    TwilioClient = None
+    RequestValidator = None
+    _TWILIO_OK = False
 
-# --- Init mémoire tolérante au profil cassé ---
-try:
-    memory = Memory(profile_path=PROFILE_PATH)
-except Exception as e:
-    print(f"⚠️ Profil invalide ou introuvable ({e}) → fallback par défaut")
-    class _Dummy:
-        def get_profile(self):
-            return {
-                "display_name": "Ami",
-                "language": "fr",
-                "timezone": "Europe/Paris",
-                "tone": "chaleureux",
-                "short_sentences": True,
-            }
-    memory = _Dummy()
+TWILIO_SID   = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM  = os.environ.get("TWILIO_WHATSAPP_FROM")   # ex: whatsapp:+14155238886
+VERIFY_TWILIO_SIGNATURE = (os.environ.get("VERIFY_TWILIO_SIGNATURE", "false").lower() == "true")
 
-# --- Helper HTTP Twilio avec retries (429/5xx) ---
-def _post_twilio_with_retry(url, data, auth, timeout=15, retries=2):
-    for attempt in range(retries + 1):
-        try:
-            r = requests.post(url, data=data, auth=auth, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            return r
-        except requests.RequestException:
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            raise
+twilio_client   = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if (_TWILIO_OK and TWILIO_SID and TWILIO_TOKEN) else None
+twilio_validator= RequestValidator(TWILIO_TOKEN) if (VERIFY_TWILIO_SIGNATURE and _TWILIO_OK and TWILIO_TOKEN) else None
 
-# --- Vérification optionnelle de signature Twilio (HMAC-SHA1/Base64) ---
-def _verify_twilio_sig(req) -> bool:
-    if os.getenv("VERIFY_TWILIO_SIGNATURE", "false").lower() not in ("1", "true", "yes"):
-        return True  # désactivé (local/sandbox)
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN") or ""
-    public_url = (os.getenv("PUBLIC_WEBHOOK_URL") or "").rstrip("/")
-    sig = req.headers.get("X-Twilio-Signature") or ""
-    if not auth_token or not public_url or not sig:
+def _verify_twilio(req) -> bool:
+    if not VERIFY_TWILIO_SIGNATURE:
+        return True
+    if not twilio_validator:
         return False
-    if req.form:
-        parts = "".join(v for k, v in sorted(req.form.items()))
-        data = public_url + parts
-    else:
-        # Twilio envoie du form-urlencoded ; fallback JSON au cas où
-        data = public_url + (req.get_data(as_text=True) or "")
-    mac = hmac.new(auth_token.encode("utf-8"), data.encode("utf-8"), hashlib.sha1)
-    expected = base64.b64encode(mac.digest()).decode("utf-8")
-    return hmac.compare_digest(sig, expected)
+    try:
+        signature = req.headers.get("X-Twilio-Signature", "")
+        url = req.url
+        params = dict(req.form)
+        return twilio_validator.validate(url, params, signature)
+    except Exception as e:
+        print(f"[SIG][err] {e}", flush=True)
+        return False
 
-# ------------------- Routes -------------------
+def _send_whatsapp(to: str, body: str) -> str | None:
+    body = _clean_outgoing(body)   # <<--- AJOUT
+    if not twilio_client or not TWILIO_FROM:
+        print("[TWILIO] no-op (client absent ou FROM manquant).", flush=True)
+        return None
+    ...
 
-@app.get("/health")
+    try:
+        msg = twilio_client.messages.create(from_=TWILIO_FROM, to=to, body=body)
+        return msg.sid
+    except Exception as e:
+        print(f"[TWILIO][err] {e}", flush=True)
+        return None
+
+# ---- Prompt système ----
+def _load_system_prompt() -> str:
+    txt = "Tu es un compagnon simple et bienveillant. Phrases courtes. Ton chaleureux."
+    try:
+        prompt_path = os.path.join(CORE_DIR, "LLM_SYSTEM_PROMPT.txt")
+        if os.path.exists(prompt_path):
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                raw = (f.read() or "").strip()
+                if raw:
+                    txt = raw
+    except Exception:
+        pass
+    return txt
+
+def _history_to_msgs(history: List[Dict]) -> List[Dict]:
+    msgs = []
+    for h in history:
+        role = "user" if (h.get("direction") == "IN") else "assistant"
+        msgs.append({"role": role, "content": h.get("text", "")})
+    return msgs
+
+def _generate_with_history(user_text: str, history: List[Dict]) -> str:
+    msgs = [{"role": "system", "content": _load_system_prompt()}]
+    msgs.extend(_history_to_msgs(history))
+    msgs.append({"role": "user", "content": user_text})
+    return _openai_generate(msgs)
+
+# ---- Flask + worker ----
+app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=int(os.environ.get("WEBHOOK_WORKERS", "4")))
+
+# Observabilité simple (req_id + latence)
+@app.before_request
+def _obs_begin():
+    g.req_id = str(uuid.uuid4())[:8]
+    g.t0 = time.time()
+
+@app.after_request
+def _obs_end(resp):
+    try:
+        dt = int((time.time() - getattr(g, "t0", time.time())) * 1000)
+        print(f"[REQ] id={getattr(g,'req_id','-')} {request.method} {request.path} {resp.status_code} {dt}ms", flush=True)
+    except Exception:
+        pass
+    return resp
+
+# Init DB (SQLite par défaut) — crée ./data/app.db si absent
+coreapp.bootstrap_memory()
+
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify(health_payload(instance_label=INSTANCE_LABEL)), 200
+    return jsonify({"status": "ok"}), 200
 
-@app.post("/internal/send")
+@app.route("/internal/send", methods=["POST"])
 def internal_send():
-    expected = os.getenv("INTERNAL_TOKEN")
-    provided = request.headers.get("X-Token")
-    if not expected or provided != expected:
-        return jsonify({"error": "forbidden"}), 403
+    token = request.headers.get("X-Token") or ""
+    expect = os.environ.get("INTERNAL_TOKEN") or ""
+    if not expect or token != expect:
+        return jsonify({"error":"forbidden"}), 403
 
     data = request.get_json(silent=True) or {}
-    user_text = (data.get("text") or "Bonjour").strip()
-    profile = memory.get_profile()
+    text = (data.get("text") or "").strip() or "ping"
+    user_id = (data.get("user_id") or "local")
 
-    req_id = str(uuid.uuid4())
-    t0 = now()
+    # Mode diag: ?nollm=1 pour mesurer le plafond sans appel LLM
+    no_llm = (request.args.get("nollm","0") == "1")
 
-    # IN -> DB
-    user_id = "local"
+    t0 = time.time()
+    if no_llm:
+        reply = f"(NO-LLM) {text}"
+        # on log IN/OUT quand même pour rester isofonctionnel
+        coreapp.process_incoming(user_id, text, None, lambda t,h: reply)
+    else:
+        reply = coreapp.process_incoming(user_id, text, None, _generate_with_history)
+    dt = round((time.time()-t0)*1000)
+    reply = _clean_outgoing(reply)
+
+
+    return jsonify({"ok": True, "ms": dt, "reply": reply, "no_llm": no_llm}), 200
+
+
+def _worker_process(sender: str, text_in: str, msg_sid: str | None):
     try:
-        add_message(user_id, "IN", user_text, msg_sid=None, channel="internal")
-    except Exception as e:
-        log_json("db_write_error", where="internal_send_IN", error=str(e), req_id=req_id)
-
-    # Historique
+        print(f"[IN] id={getattr(g,'req_id','-')} {sender} sid={msg_sid} text={text_in[:120]}", flush=True)
+    except Exception:
+        print(f"[IN] {sender} sid={msg_sid} text={text_in[:120]}", flush=True)
     try:
-        history = get_history(user_id, limit=16)
+        reply = coreapp.process_incoming(sender.replace("whatsapp:", ""), text_in, msg_sid, _generate_with_history)
+        if reply:
+            out_sid = _send_whatsapp(sender, reply)
+            print(f"[OUT] to={sender} tw_sid={out_sid}", flush=True)
+        else:
+            print(f"[DUP] sid={msg_sid} ignoré", flush=True)
     except Exception as e:
-        history = []
-        log_json("db_read_error", where="internal_get_history", error=str(e), req_id=req_id)
+        print(f"[WORKER][err] {e}", flush=True)
 
-    # LLM (+fallback)
-    try:
-        reply = safe_generate_reply_with_history(user_text, history, profile)
-        ok = True
-    except Exception as e:
-        log_json("error", where="internal_send_llm", error=str(e), req_id=req_id)
-        name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
-        reply, ok = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝", False
-
-    # OUT -> DB
-    try:
-        add_message(user_id, "OUT", reply, msg_sid=None, channel="internal")
-    except Exception as e:
-        log_json("db_write_error", where="internal_send_OUT", error=str(e), req_id=req_id)
-
-    lat = round(now() - t0, 3)
-    log_json("internal_send_done", req_id=req_id, status="ok" if ok else "fail", latency=lat)
-
-    if (request.args.get("format") or "").lower() == "text":
-        return Response(reply, mimetype="text/plain; charset=utf-8"), 200
-    return jsonify({"ok": ok, "reply": reply, "latency": lat}), 200
-
-@app.post("/internal/checkin")
-def internal_checkin():
-    expected = os.getenv("INTERNAL_TOKEN")
-    provided = request.headers.get("X-Token")
-    if not expected or provided != expected:
-        return jsonify({"error": "forbidden"}), 403
-
-    t0 = now()
-
-    body = request.get_json(silent=True) or {}
-    to = body.get("to") or os.getenv("USER_WHATSAPP_TO")
-    weather_hint = body.get("weather") or os.getenv("WEATHER_SUMMARY")
-
-    profile = memory.get_profile()
-    now_str = datetime.now().strftime("%A %d %B, %H:%M")
-    prompt = ("Fais un check-in du matin (bref). "
-              "Format: bonjour bref + météo (si fournie) + 1–2 priorités + 1 conseil.")
-    if weather_hint:
-        prompt += f" Météo: {weather_hint}."
-    prompt += f" Date/heure: {now_str}. Utilise mes intérêts si utile."
-
-    try:
-        text = safe_generate_reply(prompt, profile)
-    except Exception as e:
-        name = (profile or {}).get("display_name", "Coach") if isinstance(profile, dict) else "Coach"
-        text = (f"Bonjour ! Petit check-in rapide. Deux priorités + un conseil pour lancer la journée. "
-                f"({type(e).__name__})\n— {name} 🤝")
-
-    sid = os.getenv("TWILIO_ACCOUNT_SID")
-    tok = os.getenv("TWILIO_AUTH_TOKEN")
-    from_wa = os.getenv("TWILIO_SANDBOX_FROM", "whatsapp:+14155238886")
-
-    if sid and tok and to:
-        try:
-            url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-            r = _post_twilio_with_retry(url, {"From": from_wa, "To": to, "Body": text},
-                                        auth=(sid, tok), timeout=15, retries=2)
-            try:
-                js = r.json()
-            except Exception:
-                js = {"status_code": r.status_code, "text": r.text[:200]}
-            log_json("checkin_done", status="sent", latency=round(now()-t0,3))
-            return jsonify({"status": "sent", "twilio": js}), 200
-        except Exception as e:
-            log_json("checkin_done", status="twilio-error", error=str(e), latency=round(now()-t0,3))
-            return jsonify({"status": "twilio-error",
-                            "error": f"{type(e).__name__}: {str(e)[:160]}",
-                            "dry_run_text": text}), 200
-
-    log_json("checkin_done", status="dry-run", latency=round(now()-t0,3))
-    return jsonify({"status": "dry-run", "text": text}), 200
-
-@app.post("/whatsapp/webhook")
+@app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
-    t0 = now()
+    if not _verify_twilio(request):
+        return Response(status=403)
+    sender = request.form.get("From") or ""
+    text_in = (request.form.get("Body") or "").strip() or "Salut"
+    msg_sid = request.form.get("MessageSid")
+    if not sender:
+        return Response(status=200)
+    executor.submit(_worker_process, sender, text_in, msg_sid)
+    return Response(status=200)
 
-    # (option) vérifier la signature Twilio
-    if not _verify_twilio_sig(request):
-        log_json("twilio_sig_invalid")
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>',
-                        mimetype="application/xml", status=403)
-
-    incoming = request.form or request.json or {}
-    text = (incoming.get("Body") or incoming.get("text") or "").strip() or "Salut"
-    from_raw = incoming.get("From") or incoming.get("from") or "unknown"
-    user_id = normalize_user_id(from_raw)
-    msg_sid = incoming.get("MessageSid") or incoming.get("messageSid")
-    req_id = msg_sid or str(uuid.uuid4())
-
-    # 0) dédup strict (avant tout traitement)
-    if msg_sid and has_incoming_sid(msg_sid):
-        log_json("dedup_skip", req_id=req_id, user_id=user_id, msg_sid=msg_sid)
-        return Response('<?xml version="1.0" encoding="UTF-8"?><Response/>',
-                        mimetype="application/xml", status=200)
-
-    # 1) enregistrer IN
-    try:
-        add_message(user_id, "IN", text, msg_sid=msg_sid, channel="whatsapp")
-    except Exception as e:
-        log_json("db_write_error", where="webhook_IN", error=str(e), req_id=req_id)
-
-    # 2) mini rate-limit (cooldown)
-    last = LAST_SEEN.get(user_id, 0.0)
-    if now() - last < RATE_LIMIT_SECONDS:
-        reply = "Merci 🙂 je traite ton message, j’arrive…"
-        try:
-            add_message(user_id, "OUT", reply, msg_sid=None, channel="whatsapp")
-        except Exception as e:
-            log_json("db_write_error", where="webhook_OUT_rl", error=str(e), req_id=req_id)
-        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
-        log_json("rate_limit", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
-        return Response(twiml, mimetype="application/xml", status=200)
-
-    LAST_SEEN[user_id] = now()
-
-    # 3) historique + LLM
-    try:
-        history = get_history(user_id, limit=16)
-    except Exception as e:
-        history = []
-        log_json("db_read_error", where="get_history", error=str(e), req_id=req_id)
-
-    profile = memory.get_profile()
-    try:
-        reply = safe_generate_reply_with_history(text, history, profile)
-    except Exception as e:
-        log_json("error", where="webhook_llm", error=str(e), req_id=req_id)
-        name = profile.get("display_name") if isinstance(profile, dict) else "Coach"
-        reply = f"Désolé, je ne peux pas répondre pour le moment. — {name} 🤝"
-
-    # 4) OUT -> DB
-    try:
-        add_message(user_id, "OUT", reply, msg_sid=None, channel="whatsapp")
-    except Exception as e:
-        log_json("db_write_error", where="webhook_OUT", error=str(e), req_id=req_id)
-
-    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(reply)}</Message></Response>'
-    log_json("webhook_done", req_id=req_id, user_id=user_id, latency=round(now()-t0,3))
-    return Response(twiml, mimetype="application/xml")
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    # Host 127.0.0.1 en local; en prod Render, c'est gunicorn qui sert.
-    app.run(host="127.0.0.1", port=port, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)

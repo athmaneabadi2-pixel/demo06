@@ -24,3 +24,13 @@ curl
 python
 set
 requetedbeaver.txt
+# demo06 local artifacts
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Local sqlite files
+*.db
+*.db-shm
+*.db-wal

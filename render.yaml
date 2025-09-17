@@ -1,10 +1,12 @@
 services:
-  - type: web
-    name: demo06-companion
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python app.py"
-    plan: free
-    envVars:
-      - key: PORT
-        value: "10000"
+- type: web
+  name: companion-demo07
+  env: python
+  plan: free
+  buildCommand: pip install -r requirements.txt
+  startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+  envVars:
+  - key: PORT
+    value: 8000
+  healthCheckPath: /health
+

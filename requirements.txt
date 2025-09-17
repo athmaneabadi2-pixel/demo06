@@ -1,5 +1,8 @@
-Flask==3.0.3
+
 python-dotenv==1.0.1
-gunicorn
-openai
+
 requests
+Flask>=3.0
+gunicorn>=21.2
+openai>=1.40
+twilio>=9.0
